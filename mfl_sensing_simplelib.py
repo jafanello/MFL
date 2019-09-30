@@ -105,7 +105,7 @@ def particle_covariance_mtx(weights,locations):
         # index, axis=2. Using the Einstein summation convention (ESC),
         # we can reduce over the particle index easily while leaving
         # the model parameter index to vary between the two factors
-        # of xs.
+        # of xs.DataPrecModel
         #
         # This corresponds to evaluating A_{m,n} = w_{i} x_{m,i} x_{n,i}
         # using the ESC, where A_{m,n} is the temporary array created.
@@ -403,7 +403,9 @@ class ExpDecoKnownPrecessionModel():
         
         return self.pr0_to_likelihood_array(outcomes, pr0)
         
-        
+
+
+
   
 ####################################################
 ##########  Heuristic  definitions       ##########
@@ -1317,7 +1319,7 @@ class NoisyGaussianExpDecoKnownPrecessionModel(ExpDecoKnownPrecessionModel):
         self.n_rep = n_rep  # number of experimental repetitions
 
     def likelihood(self, outcomes, modelparams, expparams, noisy=False, res_no_noise=None):
-        import random
+
         p = super().likelihood(outcomes, modelparams, expparams)
         if not noisy:
             return p
@@ -1336,12 +1338,131 @@ class NoisyGaussianExpDecoKnownPrecessionModel(ExpDecoKnownPrecessionModel):
         return self.pr0_to_likelihood_array(outcomes, pr0)
 
     def add_noise(self, z):
+        import random
         noisy_z = z + np.random.normal(loc=0, scale=1./np.sqrt(4*self.c_eff**2 *self.n_rep))      # Degen 17 (eqn 37)
 
         return noisy_z, z
 
+    def sample(self, z, n_samples=1e3):
+        return np.random.normal(loc=z, scale=1./np.sqrt(4*self.c_eff**2 *self.n_rep), size=int(n_samples))
 
-# NOT WORKING
+class NoisyPoissonianExpDecoKnownPrecessionModel(ExpDecoKnownPrecessionModel):
+    def __init__(self, min_freq=0.0, max_freq=1.0, invT2=0, cts_0=0.04, cts_1=0.03, n_rep=1e6):
+        """
+        :param min_freq:
+        :param max_freq:
+        :param invT2:
+        :param cts_0: counts per laser shot in |0>
+        :param cts_1: counts per laser shot in |1>
+        :param n_rep: (=n_sweeps) number of Ramsey reptitions per epoch
+        """
+        super().__init__(min_freq, invT2)
+
+        self.cts_0 = cts_0
+        self.cts_1 = cts_1
+        self.n_rep = n_rep  # number of experimental repetitions
+
+    def likelihood(self, outcomes, modelparams, expparams, noisy=False, res_no_noise=None):
+
+        p = super().likelihood(outcomes, modelparams, expparams)
+        if not noisy:
+            return p
+
+        if p.shape != (2, 1, 1):
+            raise NotImplementedError("NoisyGaussian only implemented for 1d model. Shape: {}".format(p.shape))
+        z = p[0,0,0] # value of interet
+        z, z_real = self.add_noise(z)
+        if type(res_no_noise) is list:
+            res_no_noise.append(z_real)
+
+        # prepare shape for output
+        pr0 = np.zeros((modelparams.shape[0], expparams.shape[0]))
+        pr0[:,:] = z
+
+        return self.pr0_to_likelihood_array(outcomes, pr0)
+
+    def add_noise(self, z):
+        # model z as single Poissonian distribution
+        # assumes that quantum projection noise is much smaller than shot noise!
+        # first noise in photons
+        noisy_z_phot = self.sample(z, n_samples=1, as_photons=True)  # all repetitions
+        noisy_z = self.photons_to_z(noisy_z_phot)
+
+        return noisy_z, z
+
+    def photons_to_z_lin_interp(self, z_phot):
+        from scipy.interpolate import interp1d
+        m = interp1d([self.n_rep * self.cts_0, self.n_rep *self.cts_1], [0, 1], fill_value='extrapolate')
+
+        return m(z_phot)
+
+    def photons_to_z_prob_fract(self, z_phot_int):
+        from scipy.stats import poisson
+
+        # method as in labbook 2019/9/26
+        lamda_0 = self.n_rep * self.cts_0
+        lamda_1 = self.n_rep * self.cts_1
+        p_0 = np.asarray(poisson.pmf(z_phot_int, lamda_0))
+        p_1 = np.asarray(poisson.pmf(z_phot_int, lamda_1))
+
+        # numpy construction of output array
+        z_arr = np.zeros(len(z_phot), dtype=float)
+        z_0 = (p_0 > p_1).astype(int)   # array is one where p_0 > p_1
+        z_arr += z_0 * 0.5 * p_1 / p_0
+        z_1 = (p_0 <= p_1).astype(int)
+        z_arr += z_1 * (1 - 0.5 * p_0 / p_1)
+
+        return z_arr
+
+    def photons_to_z_maxlike(self, z_phot_int, n_bin=50):
+        from scipy.stats import poisson
+
+        z_res = []
+        for z_phot_int_i in z_phot_int:
+
+            z_phot_check = np.asarray(z_phot_int_i, dtype=int)
+            if not np.allclose(z_phot_check, z_phot_int_i):
+                raise RuntimeError("Got non-integer photon number {}.".format(z_phot_int_i))
+
+            p_max = 0
+            z = 0
+            for n_phot in np.linspace(self.n_rep * self.cts_1, self.n_rep * self.cts_0, n_bin):
+                p_i = poisson.pmf(z_phot_int_i, n_phot)
+                if p_i > p_max:
+                    p_max = p_i
+                    z = (n_phot/self.n_rep - self.cts_0)/(self.cts_1 - self.cts_0)
+
+            z_res.append(z)
+
+        return z_res
+
+    def photons_to_z(self, z_phot, mode='linear'):
+
+        z_phot_int = np.asarray(z_phot, dtype=int)
+        if not np.allclose(z_phot, z_phot_int):
+            raise RuntimeError("Got non-integer photon number {}. Rel dif {}".format(z_phot, (z_phot-z_phot_int)/z_phot))
+
+        if mode == 'linear':
+            return self.photons_to_z_lin_interp(z_phot_int)
+        elif mode == 'probfrac':
+            return self.photons_to_z_prob_fract(z_phot_int)
+        elif mode == 'maxlike':
+            return self.photons_to_z_maxlike(z_phot_int)
+        else:
+            raise ValueError("Unknown conversion mode: {}".format(mode))
+
+    def sample(self, z, n_samples=1e3, as_photons=False):
+        z_phot = self.n_rep * (z * self.cts_1 + (1 - z) * self.cts_0)  # expectation value in photons
+        z_phot = np.random.poisson(lam=z_phot, size=int(n_samples))
+
+        if as_photons:
+            z_ret = z_phot
+        else:
+            z_ret = self.photons_to_z(z_phot)
+
+        return z_ret
+
+# NOT WORKING, see Andrea's nv_sensing_lib
 class NoisyExpDecoKnownPrecessionModel():
 
     def __init__(self, min_freq=0.0, max_freq=1.0, invT2=0, noise="Absent", eta=1.0):
@@ -1358,3 +1479,5 @@ class NoisyExpDecoKnownPrecessionModel():
 
     def get_model(self):
         return self.model
+
+

@@ -765,13 +765,14 @@ class AparrKnownHahnModel():
 
     ## INITIALIZER ##
 
-    def __init__(self, b_gauss, a_par, min_freq=0):
+    def __init__(self, b_gauss, a_par, min_freq=0, c_scale_2=1):
         super().__init__()
 
         self._min_freq = min_freq               # MHz rad
         self._b_gauss = b_gauss
         self._gamma = 1.07084e3 * 2 * np.pi     # 13-C, Hz/G, [w] = Hz rad
         self._a_par = a_par                     # parallel A_hfs, Hz rad
+        self._c_sc2 = c_scale_2                  # amplitude of HE, overwrites sin(phi_01) amplitude
 
         # Initialize a default scale matrix.
         self._Q = np.ones((self.n_modelparams,))
@@ -989,13 +990,19 @@ class AparrKnownHahnModel():
         h_1 = np.sqrt((B - A_par / self._gamma)** 2 + (A_perp / self._gamma)** 2)
         theta_0 = self._gamma * h_0 * tau
         theta_1 = self._gamma * h_1 * tau
+
         phi_h01 = np.arcsin(A_as_B * np.sin(alpha) / (np.sqrt(B ** 2 - 2 * A_as_B * B * np.cos(alpha) + A_as_B ** 2)))
 
         # Allocating first serves to make sure that a shape mismatch later
         # will cause an error.
         pr0 = np.zeros((modelparams.shape[0], expparams.shape[0]))
 
-        l = 0.5 + 0.5 * (1 - 2 * np.sin(phi_h01) ** 2 * np.sin(theta_0 / 2) ** 2 * np.sin(theta_1 / 2) ** 2)
+        if self._c_sc2 is 1:
+            l = 0.5 + 0.5 * (1 - 2 * np.sin(phi_h01) ** 2 * np.sin(theta_0 / 2) ** 2 * np.sin(theta_1 / 2) ** 2)
+        else:
+            #c_scale_contrast_2 = 0.3
+            l = 0.5 + 0.5 * (1 - 2 * self._c_sc2 * np.sin(theta_0 / 2) ** 2 * np.sin(
+                theta_1 / 2) ** 2)
 
         try:
             pr0[:, :] = l.transpose()
@@ -1286,14 +1293,15 @@ class MultiHahnPGH(MultiPGH):
         return self.avoid_flat_likelihood(eps)
 
     def avoid_flat_likelihood(self, eps):
-        tau_period = 1000 / self._b_gauss   # us, rough (empirically)
+        #tau_period_us = 1 / self._b_gauss   # us, rough (empirically)
+        tau_period_us = 1/(1070.84 * self._b_gauss)*1e6  # lamor precesion of 13-C
         tau = eps[self._t]
-        n_periods = tau / tau_period
+        n_periods = tau / tau_period_us
 
         is_flat_l = True
         while is_flat_l:
-            if abs((tau % tau_period) - tau_period/2) > tau_period / 4:
-                tau += tau_period/10
+            if abs((tau % tau_period_us) - tau_period_us/2) > tau_period_us / 4:
+                tau += tau_period_us/10
             else:
                 is_flat_l = False
 

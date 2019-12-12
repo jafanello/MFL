@@ -1589,6 +1589,74 @@ class T2_Thresh_MultiHahnPGH(MultiHahnPGH):
         #return eps
         return self.avoid_flat_likelihood(eps)
 
+class T2RandPenalty_MultiHahnPGH(MultiHahnPGH):
+
+    def __init__(self, updater, B_gauss, tau_thresh_rescale, oplist=None, norm='Frobenius', inv_field='x_', t_field='t',
+                 inv_func=identity,
+                 t_func=identity,
+                 maxiters=10,
+                 other_fields=None,
+                 scale_f=2.0
+                 ):
+        super().__init__(updater, B_gauss)
+        self._updater = updater
+        self._oplist = oplist
+        self._norm = norm
+        self._x_ = inv_field
+        self._t = t_field
+        self._inv_func = inv_func
+        self._t_func = t_func
+        self._maxiters = maxiters
+        self._other_fields = other_fields if other_fields is not None else {}
+        self._b_gauss = B_gauss
+        self.tau_thresh_rescale = tau_thresh_rescale
+        self.scale_f = scale_f
+
+    def __call__(self):
+        eps = super().__call__()
+        #eps[self._t] = 100
+
+        tau = eps['t']
+
+        if self.should_correct(tau):
+            eps['t'] = self.apply_penalty_randomized(tau * 1e-6) * 1e6
+
+        #return eps
+        return self.avoid_flat_likelihood(eps)
+
+    def should_correct(self, taus_s):
+        return True
+
+    def should_correct_randomized(self, tau_s):
+
+        if tau_s > self.tau_thresh_rescale:
+            rand = np.random.rand() # [0, 1)
+            if rand > - np.exp(- tau_s/self.tau_thresh_rescale) + 1:      # -exp(-x)+1 < 1
+                return True
+
+        return False
+
+    def apply_penalty(self, tau_s):
+
+        if tau_s <= self.tau_thresh_rescale:
+            return tau_s
+
+        # rescale tau-t2* to 0... T2* (*scale_f)
+        tau_corrected_s = self.tau_thresh_rescale + (1 - np.exp(- (tau_s/self.tau_thresh_rescale-1))) * self.scale_f * self.tau_thresh_rescale      # 0 < -exp(-(x-1))+1 < 1
+
+        return tau_corrected_s
+
+    def apply_penalty_randomized(self, tau_s):
+        # randomly multiply scale with [0, 1)
+        # avoid that all very big taus get mapped to a single value
+
+        save_scale_f = self.scale_f
+        rand = np.random.rand()
+        self.scale_f *= rand
+        tau_corrected_s = self.apply_penalty(tau_s)
+        self.scale_f = save_scale_f
+
+        return tau_corrected_s
 
 
 

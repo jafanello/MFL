@@ -1542,15 +1542,17 @@ class MultiHahnPGH(MultiPGH):
         return self.avoid_flat_likelihood(eps)
 
     def avoid_flat_likelihood(self, eps):
-        #tau_period_us = 1 / self._b_gauss   # us, rough (empirically)
-        tau_period_us = 1/(1070.84 * self._b_gauss)*1e6  # lamor precesion of 13-C
+        # tau_period_us = 1 / self._b_gauss   # us, rough (empirically)
+        tau_period_us = 1 / (1070.84 * self._b_gauss) * 1e6  # lamor precesion of 13-C
         tau = eps[self._t]
         n_periods = tau / tau_period_us
 
+        width_allow = 0.25 * tau_period_us
+
         is_flat_l = True
         while is_flat_l:
-            if abs((tau % tau_period_us) - tau_period_us/2) > tau_period_us / 4:
-                tau += tau_period_us/10
+            if abs((tau % tau_period_us) - tau_period_us / 2) > width_allow:
+                tau += tau_period_us / 10
             else:
                 is_flat_l = False
 

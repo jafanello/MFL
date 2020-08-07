@@ -1908,16 +1908,21 @@ class MultiPGH(qi.Heuristic):
 
         return tau_res
 
-    def round_up_to_mod(self, f, mod=2, min_int=2):
+    def round_up_to_mod(self, f, mod=2, min_int=2, max_int=-1):
         """
         Rounds up to a multiplier. Eg. mod=4:
         3->4, 4->4, 5->8, ...
         """
         rounded = np.round(f / mod) * mod
         try:
+            # handle array like input
             rounded[rounded <= 0] = min_int
+            if max_int > 0:
+                rounded[rounded > max_int] = max_int
         except TypeError:
+            # handle single value input
             if rounded < min_int: return int(min_int)
+            if rounded > max_int: return int(max_int)
 
         return int(rounded)
 
@@ -2333,7 +2338,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         tau = tau_array_us
         n_dd = ndd_array
         if np.any(n_dd[n_dd % self._restr_ndd_mod != 0]):
-            print("Warning: Found n_dd % {} != 0".format(self._restr_ndd_mod))
+            print("Warning: Found n_dd % {} != 0 in {}".format(self._restr_ndd_mod, ndd_array))
 
         fi_list = self.calc_fisher_information_at_A(Apar/(2*np.pi), Aperp/(2*np.pi), tau_us=tau, n_dd=n_dd)
 
@@ -2494,9 +2499,15 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         n_dd_min = ndd_min // int(self._restr_ndd_mod) * self._restr_ndd_mod
         if n_dd_min < self._restr_ndd_mod:
             n_dd_min = self._restr_ndd_mod
-        n_dd_max = 1 + int(np.ceil(ndd_max / self._restr_ndd_mod)) * self._restr_ndd_mod
 
-        return np.arange(n_dd_min, n_dd_max, self._restr_ndd_mod)
+        n_dd_max = ndd_max
+        if ndd_max <= n_dd_min + self._restr_ndd_mod:
+            n_dd_max = n_dd_min + self._restr_ndd_mod
+
+        #n_dd_max = 1 + int(np.ceil(ndd_max / self._restr_ndd_mod)) * self._restr_ndd_mod
+
+        # + 1 to inculde stop point
+        return np.arange(n_dd_min, n_dd_max+1, self._restr_ndd_mod)
 
     def estimate_tau_res_width(self, tau_res_k_1, n_dd):
 
@@ -2693,17 +2704,15 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
             n_dd_right = n_dd + sigma_n[1]
             #print("Debug: Extending sigma_n_right: {}".format(n_dd_right))
 
-        if n_dd_left < 2:
-            n_dd_left = 2
-        #if n_dd_right <= n_dd_left + self._restr_ndd_mod:
-        #    n_dd_right = n_dd_left + self._restr_ndd_mod
-        #print("Fine ranges: n_dd= {}-{}, tau= {}.{}".format(n_dd_left, n_dd_right, tau_left, tau_right))
+        ndd_range = self.get_ndd_range(n_dd_left, n_dd_right)
+        #print("Fine ranges: n_dd= {}-{}, tau= {}.{}".format(ndd_range[0], ndd_range[-1], tau_left, tau_right))
 
         if n_points > 1:
             tau_arr = np.concatenate([np.linspace(tau_left, tau_right, n_points).flatten(), np.asarray(tau_us)])
         else:
             tau_arr = np.asarray(tau_us)
-        n_dd_arr = np.concatenate([self.get_ndd_range(n_dd_left, n_dd_right), np.asarray(n_dd)])
+        n_dd_arr = np.concatenate([ndd_range, np.asarray(n_dd)])
+
         tau_grid, n_grid = np.meshgrid(tau_arr, n_dd_arr)
 
         tau_opt, ndd_opt = self._optimize_fi(tau_grid.flatten(), n_grid.flatten(), opt_mode, debug_plots=debug_plots)
@@ -2844,7 +2853,8 @@ class MultiDD_EstAnResOptFish_PGH(MultiDD_EstAOptFish_PGH):
 
             # directly from resonance
             tau_res = self.calc_tau_k(Apar / (2 * np.pi), 1, no_warning=True)
-            n_dd = self.round_up_to_mod(t_evol_us / (tau_res * 1e6), mod=self._restr_ndd_mod, min_int=self._restr_ndd_mod)
+            n_dd = self.round_up_to_mod(t_evol_us / (tau_res * 1e6), mod=self._restr_ndd_mod,
+                                        min_int=self._restr_ndd_mod, max_int=self._n_pi_max)
             eps[self._t] = tau_res * 1e6
             eps[self._n] = n_dd
 
@@ -3000,8 +3010,9 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
             # add uncertainty from variance of A_par
 
 
-
-            n_dd = self.round_up_to_mod(t_evol_us / (tau_res * 1e6), mod=self._restr_ndd_mod, min_int=self._restr_ndd_mod)
+            n_dd = self.round_up_to_mod(t_evol_us / (tau_res * 1e6), mod=self._restr_ndd_mod,
+                                        min_int=self._restr_ndd_mod, max_int=self._n_pi_max)
+            #print("coarse n_dd = {}, tau= {}".format(n_dd, t_evol_us / (tau_res * 1e6)))
             eps[self._t] = tau_res * 1e6
             eps[self._n] = n_dd
 

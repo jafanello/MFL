@@ -1922,7 +1922,7 @@ class MultiPGH(qi.Heuristic):
         except TypeError:
             # handle single value input
             if rounded < min_int: return int(min_int)
-            if rounded > max_int: return int(max_int)
+            if rounded > max_int and max_int > 0: return int(max_int)
 
         return int(rounded)
 
@@ -2164,7 +2164,10 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
                  other_fields=None,
                  n_pi_max = 128,
                  restr_ndd_mod = 2,
-                 opt_mode='avg_idx'
+                 opt_mode='avg_idx',
+                 norm_fisher=False,
+                 eps_prefactor=4,
+                 coarse_opt_k=5
                  ):
         super().__init__(updater)
         self._updater = updater
@@ -2183,8 +2186,13 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         self._optimization_fi_mode = opt_mode
         self._cheat_w_true = None
         self._track_fi = []
+        self._track_entropy = []
+        self._track_entr_offset = 0
         self._restr_ndd_mod = restr_ndd_mod
         self._calc_fi_mode = 'coarse_1'
+        self._norm_fi = norm_fisher
+        self._eps_prefactor = eps_prefactor
+        self._coarse_opt_k = coarse_opt_k
 
     def __call__(self, skip_optimize=False):
         eps = super().__call__()  # eps[t_] ~ 1/sig_p
@@ -2201,14 +2209,14 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         while bad_optimum and i_trial < max_trial:
             Apar, Aperp = self.estimate_mean()  # Mhz rad
 
-            t_evol_us = 4 * eps[self._t][0]  # us
+            t_evol_us = self.eps_to_tevol(eps)  # us
             if max_trial <= 1:
                 # break loop after first run
                 bad_optimum = False
             if i_trial != 0:
                 # get new t_evol from posterior, attention: return eps[_t] is tau, not t_evol!
                 eps = super().__call__()  # eps[t_] ~ 1/sig_p
-                t_evol_us = 4 * eps[self._t][0]  # us
+                t_evol_us = self.eps_to_tevol(eps)  # us
             if i_trial == 1 and fi_max != -np.inf:
                 # try old settings
                 # todo: might be counterproductive, as fi calc in ealry epochs unaaccurate
@@ -2229,66 +2237,69 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
             """
             was_penalty_applied = False
             while t_evol_us > 2 * t2 * 1e6 and t2 > 0:
+                # todo: with nomed_fi opt, this should be unnecessary
                 t_evol_us -= t_evol_us / 2  # todo: fixed constants problematic
                 was_penalty_applied = True
             #print("Current estimated Apar/Aperp: {}, {} MHz".format(Apar/(2*np.pi), Aperp/(2*np.pi)))
 
             # for a given t_tot, find n with optimized fisher info
             # from experience, only the first feq resonances optimize FI, so don't have to check low n_dd
-
-            k = 5
-            tau_res_k = self.calc_tau_k(Apar/(2*np.pi), k, no_warning=True)
-            tau_res_0 = self.calc_tau_k(Apar / (2 * np.pi), 0, no_warning=True)
-            n_dd_min = self.round_up_to_mod(t_evol_us/(tau_res_k*1e6)-4, mod=self._restr_ndd_mod)
-            n_dd_max = self.round_up_to_mod(t_evol_us/(tau_res_0*1e6)+4, min_int=16, mod=self._restr_ndd_mod)
-
             #"""
-            eps[self._t], eps[self._n] = self.optimize_fisher_information(t_evol_us, self._optimization_fi_mode,
-                                                                          n_dd_min=n_dd_min, n_dd_max=n_dd_max)
-            #"""
-            # directly from resonance
-            """
-            tau_res = self.calc_tau_k(Apar/(2*np.pi), 1, no_warning=True)
-            n_dd = self.round_up_to_mod(t_evol_us/(tau_res*1e6))
-            eps[self._t] = tau_res * 1e6
-            eps[self._n] = n_dd
-            """
-            #print("Debug: Coarse FI opt, t_evol= {} us, n_dd: {}- {} => tau= {}, n= {} for A_par= {} MHz".format(
-            #                                                                            t_evol_us, n_dd_min, n_dd_max,
-            #                                                                           eps[self._t], eps[self._n],
-            #                                                                            Apar/(2*np.pi)))
+            if self._coarse_opt_k > 0:
+                k = self._coarse_opt_k
+                tau_res_k = np.max(self.calc_tau_k(Apar/(2*np.pi), range(0,k), no_warning=True))
+                tau_res_0 = np.min(self.calc_tau_k(Apar / (2 * np.pi), range(0,k), no_warning=True))
 
+                n_dd_min = self.round_up_to_mod(t_evol_us/(tau_res_k*1e6)-4, mod=self._restr_ndd_mod)
+                n_dd_max = self.round_up_to_mod(t_evol_us/(tau_res_0*1e6)+4, min_int=16, mod=self._restr_ndd_mod)
+
+                #"""
+                eps[self._t], eps[self._n] = self.optimize_fisher_information(t_evol_us, self._optimization_fi_mode,
+                                                                              n_dd_min=n_dd_min, n_dd_max=n_dd_max)
+            else:
+                # directly from resonance
+                tau_res = self.calc_tau_k(Apar/(2*np.pi), 1, no_warning=True)
+                n_dd = self.round_up_to_mod(t_evol_us/(tau_res*1e6), min_int=self._restr_ndd_mod)
+                eps[self._t] = tau_res * 1e6
+                eps[self._n] = n_dd
+
+                n_dd_min = n_dd
+                n_dd_max = n_dd
+
+            """
+            print("Debug: Coarse FI opt, t_evol= {} us, n_dd: {}- {} => tau= {}, n= {} for A_par= {} MHz".format(
+                                                                                        t_evol_us, n_dd_min, n_dd_max,
+                                                                                       eps[self._t], eps[self._n],
+                                                                                        Apar/(2*np.pi)))
+            """
             # Currently, fine tuning decreases sensitivity!
             debug_plots = False#(t_evol_us == t2*1e6)
             # extend n_dd search range to higher vals, when hitting t2
             # no worries that we're overshooting t_evol here
-            #if t_evol_us == t2*1e6:
+
             if t_evol_us > t2 * 1e6 or was_penalty_applied:        # todo: problematic
                 # make search range in sigma_n huge to find minimum somewhere around T_2
                 tau_i_us = eps[self._t]
                 n_i = eps[self._n]
                 n_t2half = t2*1e6/(2*tau_i_us)
-                sigma_i = self.round_up_to_mod(n_i-n_t2half, mod=self._restr_ndd_mod)
+                sigma_i = self.round_up_to_mod(n_i-n_t2half, mod=self._restr_ndd_mod, min_int=self._restr_ndd_mod)
                 # go down until T_2
                 #print("Debug: at t_evol= {:.3f} us. N_dd: {} ({}-{})".format(t_evol_us, n_i, n_i-sigma_i, n_i+10))
                 eps[self._t], eps[self._n] = self.optimize_fisher_information_fine(eps[self._t], eps[self._n],
                                                                                    self._optimization_fi_mode,
                                                                                    debug_plots=debug_plots,
                                                                                    sigma_n=[sigma_i, 10])
-                """
+
                 print("[{}] Choosing tau= {} us, t_evol= {} us, n= {} ({}-{})".format(i_epoch,
                                                                               eps[self._t], eps[self._n] * eps[self._t],
                                                                             eps[self._n], eps[self._n]-sigma_i, eps[self._n]+10))
-                """
+
             else:
                 eps[self._t], eps[self._n] = self.optimize_fisher_information_fine(eps[self._t], eps[self._n],
                                                                                    self._optimization_fi_mode,
                                                                                    debug_plots=debug_plots,
                                                                                    )
             #
-
-            # new trial heuristic from knowing the resonances
-            #eps[self._t], eps[self._n] = self.optimize_fisher_information_2(n_tau, self._optimization_fi_mode)
 
 
             fi_i = self.calc_fisher_information_at_A(Apar/ (2*np.pi), Aperp/ (2*np.pi), eps[self._t], eps[self._n])
@@ -2314,9 +2325,8 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
             pass
             """
             #if np.average(fi_i) > fi_max:
-            print("Fine: [{}] t_evol= {}, tau= {} us, n= {} ({}-{}). New fi_max= {}".format(i_epoch,
+            print("Fine: [{}] t_evol= {}, tau= {} us. New fi_max= {}".format(i_epoch,
                                                                               eps[self._t] * eps[self._n], eps[self._t], eps[self._n],
-                                                                         n_dd_min, n_dd_max,
                                                                           np.average(fi_i)))
             """
 
@@ -2326,17 +2336,24 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         if np.average(fi_i) > fi_max:
             self._best_eps = eps
         self._track_fi.append(fi_i)
+        self._track_entropy.append(self.calc_entropy())
 
         return eps
 
     def call_multiPGH(self):
         return super().__call__()
 
+    def eps_to_tevol(self, eps):
+        t_evol_us = self._eps_prefactor * eps[self._t][0]
+        return t_evol_us
+
     def _optimize_fi(self, tau_array_us, ndd_array, opt_mode='idx_avg', debug_plots=False):
 
         Apar, Aperp = self.estimate_mean()  # Mhz rad
         tau = tau_array_us
         n_dd = ndd_array
+        t_evol = np.multiply(n_dd, tau*1e-6)
+
         if np.any(n_dd[n_dd % self._restr_ndd_mod != 0]):
             print("Warning: Found n_dd % {} != 0 in {}".format(self._restr_ndd_mod, ndd_array))
 
@@ -2350,10 +2367,18 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         fi_perp_vs_n[np.isnan(fi_perp_vs_n)] = -np.inf
         fi_perp_vs_n[np.isinf(fi_perp_vs_n)] = -np.inf
 
+        if self._norm_fi:
+            # min_var ~ 1/FI
+            # min_std ~ 1 / sqrt(FI)
+            # -> eta = sqrt(t)*dB = sqrt(t) * 1/sqrt(FI)
+            # -> here, minimize eta^2 = t/FI => maximize FI/t
+            fi_par_vs_n = np.multiply(fi_par_vs_n, 1/(t_evol))
+            fi_perp_vs_n = np.multiply(fi_perp_vs_n, 1/(t_evol))
+
         fi_avg_vs_n = (fi_par_vs_n + fi_perp_vs_n)/2
         fi_avg_vs_n[np.isnan(fi_avg_vs_n)] = -np.inf
         fi_avg_vs_n[np.isinf(fi_avg_vs_n)] = -np.inf
-        
+
         
         idx_par_opt = np.argmax(fi_par_vs_n)
         idx_perp_opt = np.argmax(fi_perp_vs_n)
@@ -2467,6 +2492,8 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
 
     def optimize_fisher_information(self, t_tot_us, opt_mode='idx_avg', n_dd_min=2, n_dd_max=None):
 
+        # constant t_tot_us, different n_dd
+
         n_pi_max = self._n_pi_max
         if n_dd_max:
             # allow to speed up if known that high n don't hit resonance
@@ -2485,14 +2512,14 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
 
         tau_opt, ndd_opt = self._optimize_fi(tau_us, n_dd, opt_mode)
 
-        if t_tot_us/(self._n_pi_max) > self.calc_tau_k(Apar, 0, no_warning=True) * 1e6:
-            print("Warning: Loosing Lamor resonance {:.3f} us at " \
-                  "tau/t_tot= {:.3f}/ {:.3f} us. Increase n_pi_max!".format(1e6*self.calc_tau_k(Apar, 0, no_warning=True),
+        tau_res_min_us = np.min(self.calc_tau_k(Apar, [0,1,2], no_warning=True) * 1e6)
+        if t_tot_us/(self._n_pi_max) > tau_res_min_us:
+            print("Warning: Loosing smallest resonance {:.3f} us at " \
+                  "tau/t_tot= {:.3f}/ {:.3f} us. Increase n_pi_max!".format(tau_res_min_us,
                                                                     tau_opt, t_tot_us))
 
 
         return tau_opt, ndd_opt
-
 
     def get_ndd_range(self, ndd_min, ndd_max):
 
@@ -2532,8 +2559,6 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         #print("left {}, right {}, delta {}, sl {}, sr {}".format(tau_fi_max_right, tau_fi_max_right, delta_tau, scan_left, scan_right))
 
         return scan_left, scan_right
-
-
 
     def optimize_fisher_information_2(self, t_tot_us, opt_mode='idx_avg'):
         """
@@ -2608,7 +2633,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         Search around a given tau_us, n_dd symmetrically in n_dd and tau_us direction
         """
 
-        n_points = 20
+        n_points = 50#20
         Apar, Aperp = self.estimate_mean()  # Mhz rad
         t_evol_us = tau_us * n_dd
         t2 = np.average([self._updater.model._t2_a, self._updater.model._t2_b]) # todo: think of better
@@ -2628,7 +2653,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
 
         if sigma_n[0] is None:
             #n_dd_left = self.round_up_to_mod(t_evol_us / (t2 * 1e6))
-            sigma_n_left = 50  # n_points    # todo: empirically for A_pepr= 50 kHz, should be more than 2pi reotation on nucleus
+            sigma_n_left = 100  # n_points    # todo: empirically for A_pepr= 50 kHz, should be more than 2pi reotation on nucleus
             #if n_dd - sigma_n_left < n_dd_left:
             n_dd_left = n_dd - sigma_n_left
         else:
@@ -2691,7 +2716,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
 
         if sigma_n[0] is None:
             #n_dd_left = self.round_up_to_mod(t_evol_us / (t2 * 1e6))
-            sigma_n_left = 50  # n_points    # todo: empirically for A_pepr= 50 kHz, should be more than 2pi reotation on nucleus
+            sigma_n_left = 100  # n_points    # todo: empirically for A_pepr= 50 kHz, should be more than 2pi reotation on nucleus
             #if n_dd - sigma_n_left < n_dd_left:
             n_dd_left = n_dd - sigma_n_left
         else:
@@ -2785,6 +2810,25 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
                 fi_list.append([fi_par[idx_par, idx_perp, i_tndd], fi_perp[idx_par, idx_perp, i_tndd]])
             return fi_list
 
+    def calc_entropy(self):
+
+        prior = self._updater.sample(n=self._updater.n_particles)
+        w1_min, w1_max = np.min(prior[:, 0]), np.max(prior[:, 0])
+        w2_min, w2_max = np.min(prior[:, 1]), np.max(prior[:, 1])
+        n_bins = 100
+
+        hist, _, _ = np.histogram2d(prior[:,0]/(2*np.pi), prior[:,1]/(2*np.pi),
+                              weights=self._updater.particle_weights, bins=n_bins,
+                              range=([w1_min/(2*np.pi), w1_max/(2*np.pi)],[w2_min/(2*np.pi), w2_max/(2*np.pi)]),
+                              density=True)
+
+        hist = hist[hist > 0]
+        # norming
+        # hist = hist / np.sum(hist)
+        entr = -np.sum(np.log(hist) * hist)
+
+        return entr
+
 
 class MultiDD_EstAnResOptFish_PGH(MultiDD_EstAOptFish_PGH):
 
@@ -2833,14 +2877,14 @@ class MultiDD_EstAnResOptFish_PGH(MultiDD_EstAOptFish_PGH):
         while bad_optimum and i_trial < max_trial:
             Apar, Aperp = self.estimate_mean()  # Mhz rad
 
-            t_evol_us = 4 * eps[self._t][0]  # us
+            t_evol_us = self.eps_to_tevol(eps)
             if max_trial <= 1:
                 # break loop after first run
                 bad_optimum = False
             if i_trial != 0:
                 # get new t_evol from posterior, attention: return eps[_t] is tau, not t_evol!
                 eps = super().call_multiPGH()  # eps[t_] ~ 1/sig_p
-                t_evol_us = 4 * eps[self._t][0]  # us
+                t_evol_us = self.eps_to_tevol(eps)  # us
 
             # todo: best way to enforce not too long tau?
             t2 = np.average([self._updater.model._t2_a, self._updater.model._t2_b])  # todo: think of better
@@ -2946,27 +2990,16 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
                  other_fields=None,
                  n_pi_max=128,
                  restr_ndd_mod=2,
-                 opt_mode='avg_idx'
+                 opt_mode='avg_idx',
+                 norm_fisher=False,
+                 eps_prefactor = 4,
+                 rand_sigma_a=1,
                  ):
         super().__init__(updater, B_gauss, oplist, norm, inv_field, t_field, n_field,
-                         inv_func, t_func, maxiters, other_fields, n_pi_max, restr_ndd_mod, opt_mode)
-        self._updater = updater
-        self._oplist = oplist
-        self._norm = norm
-        self._x_ = inv_field
-        self._t = t_field
-        self._n = n_field
-        self._inv_func = inv_func
-        self._t_func = t_func
-        self._maxiters = maxiters
-        self._other_fields = other_fields if other_fields is not None else {}
-        self._b_gauss = B_gauss
-        self._gamma = 1.07084e3 * 2 * np.pi  # 13-C, Hz/G, [w] = Hz rad
-        self._n_pi_max = n_pi_max
-        self._optimization_fi_mode = opt_mode
-        self._cheat_w_true = None
-        self._track_fi = []
-        self._restr_ndd_mod = restr_ndd_mod
+                         inv_func, t_func, maxiters, other_fields, n_pi_max, restr_ndd_mod, opt_mode, norm_fisher,
+                         eps_prefactor)
+
+        self._rand_sigma_A = rand_sigma_a
 
     def __call__(self, skip_optimize=False):
         eps = super().call_multiPGH()
@@ -2984,14 +3017,14 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
         while bad_optimum and i_trial < max_trial:
             Apar, Aperp = self.estimate_mean()  # Mhz rad
 
-            t_evol_us = 4 * eps[self._t][0]  # us
+            t_evol_us = self.eps_to_tevol(eps)  # us
             if max_trial <= 1:
                 # break loop after first run
                 bad_optimum = False
             if i_trial != 0:
                 # get new t_evol from posterior, attention: return eps[_t] is tau, not t_evol!
                 eps = super().call_multiPGH()  # eps[t_] ~ 1/sig_p
-                t_evol_us = 4 * eps[self._t][0]  # us
+                t_evol_us = self.eps_to_tevol(eps)  # us
 
             # todo: best way to enforce not too long tau?
             t2 = np.average([self._updater.model._t2_a, self._updater.model._t2_b])  # todo: think of better
@@ -3004,7 +3037,7 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
 
             # directly from resonance
             dA_par = np.sqrt((np.abs(self._updater.est_covariance_mtx()[0, 0])))   # MHz rad
-            Apar += np.random.normal(loc=0, scale=dA_par)
+            Apar += np.random.normal(loc=0, scale=dA_par) * self._rand_sigma_A
 
             tau_res = self.calc_tau_k(Apar / (2 * np.pi), 1, no_warning=True)
             # add uncertainty from variance of A_par
@@ -3019,11 +3052,12 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
 
             debug_plots = False  # (t_evol_us == t2*1e6)
             if debug_plots:
-                print("Estimate res t_evol= {} us => tau= {}, n= {} for A_par= {} +- {} MHz".format(
+                print("Estimate res t_evol= {} us => tau= {}, n= {} for A_par= {} +- {} MHz. Penalty: {}".format(
                     t_evol_us,
                     eps[self._t], eps[self._n],
                     Apar / (2 * np.pi),
-                    dA_par/ (2 * np.pi)))
+                    dA_par/ (2 * np.pi),
+                    was_penalty_applied))
 
 
             # extend n_dd search range to higher vals, when hitting t2
@@ -3033,11 +3067,15 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
                 # make search range in sigma_n huge to find minimum somewhere around T_2
                 tau_i_us = eps[self._t]
                 n_i = eps[self._n]
+                # go down until T_2/2
                 n_t2half = t2 * 1e6 / (2 * tau_i_us)
                 sigma_i = self.round_up_to_mod(n_i - n_t2half, mod=self._restr_ndd_mod)
-                # go down until T_2
+                # don't make search range smaller than default
+                if sigma_i < 100:
+                    sigma_i = 100
+
                 # print("Debug: at t_evol= {:.3f} us. N_dd: {} ({}-{})".format(t_evol_us, n_i, n_i-sigma_i, n_i+10))
-                # todo: test fine_3()
+
                 eps[self._t], eps[self._n] = self.optimize_fisher_information_fine_3(eps[self._t], eps[self._n],
                                                                                    self._optimization_fi_mode,
                                                                                    debug_plots=debug_plots,
@@ -3095,6 +3133,7 @@ class MultiDD_EstResnUncOptFish1d_PGH(MultiDD_EstAOptFish_PGH):
         if np.average(fi_i) > fi_max:
             self._best_eps = eps
         self._track_fi.append(fi_i)
+        self._track_entropy.append(self.calc_entropy())
 
         return eps
 
@@ -3129,7 +3168,7 @@ class MultiDD_EstAOptFish_EigenPGH(MultiEigenPGH):
 
     def __call__(self):
         eps = super().__call__()  # eps[t_] ~ 1/sig_p
-        n_tau = 4*eps[self._t][0]      # us
+        t_evol_us = self.eps_to_tevol(eps)      # us
 
         #print("Current estimated Apar/Aperp: {}, {} MHz".format(Apar/(2*np.pi), Aperp/(2*np.pi)))
 
@@ -3769,6 +3808,14 @@ class basic_SMCUpdater(qi.Distribution):
             axis=1
         )
 
+    def est_entropy(self):
+        r"""
+        Estimates the entropy of the current posterior
+        as :math:`-\sum_i w_i \log w_i` where :math:`\{w_i\}`
+        is the set of particles with nonzero weight.
+        """
+        nz_weights = self.particle_weights[self.particle_weights > 0]
+        return -np.sum(np.log(nz_weights) * nz_weights)
 
     def est_covariance_mtx(self, corr=False):
         """

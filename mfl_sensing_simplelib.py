@@ -9,16 +9,16 @@ some functions derived from CG @Microsoft
 """
 
 
-import sys, os, copy, warnings, time
+import copy, warnings
 import qinfer as qi
 import numpy as np
 from copy import deepcopy
 
 
-from functools import partial        
 from abc import ABCMeta, abstractmethod, abstractproperty    
 from future.utils import with_metaclass
 import scipy.linalg as la
+import scipy.special
 
 
 ####################################################
@@ -163,17 +163,213 @@ def DampedOscill(t, Omega, invT2):
 
     
     
-  
-  
+
+
 ####################################################
 ########## Model  definitions     ##################
 #################################################### 
+
+class PhotonOutcomeModel(qi.Model):
+
+
+    """
+    Allows to calculate non binary updates using photon probabilies.
+    """
+
+    ## INITIALIZERS ##
+    def __init__(self,
+                 phot_0, phot_1, n_sweeps,
+                 allow_identical_outcomes=False,
+                 outcome_warning_threshold=0.99,
+                 n_outcomes_cutoff=None,
+                 ):
+        qi.Model.__init__(self,
+            outcome_warning_threshold=outcome_warning_threshold,
+            allow_identical_outcomes=allow_identical_outcomes)
+        self._n_outcomes_cutoff = n_outcomes_cutoff
+        self._phot_0 = phot_0
+        self._phot_1 = phot_1
+        self._n_sweeps = n_sweeps   # number of repetitions of single experiment
+
+        if self.is_n_outcomes_constant:
+            # predefine if we can
+            self._domain = qi.IntegerDomain(min=0, max=self.n_outcomes(None) - 1)
+
+    ## CONCRETE PROPERTIES ##
+
+    @property
+    def result_state_0(self):
+        return self._phot_0 * self._n_sweeps
+
+    @property
+    def result_state_1(self):
+        return self._phot_1 * self._n_sweeps
+
+    @property
+    def is_photon_model(self):
+        return True
+
+    @property
+    def n_outcomes_cutoff(self):
+        """
+        If ``n_outcomes`` exceeds this value for
+        some expparm, ``representative_outcomes`` will use this
+        value in its place. This is useful in the case
+        of a finite yet untractible number of outcomes.
+
+        :return: Cutoff value.
+        :rtype: ``int``
+        """
+        return self._n_outcomes_cutoff
+
+    @property
+    def visibility(self):
+        return (self._phot_0 - self._phot_1)/(self._phot_0 + self._phot_1)
+
+    @property
+    def mean_p_phot(self):
+        return (self._phot_0 + self._phot_1)/2
+
+    @property
+    def n_sweeps(self):
+        return self._n_sweeps
+
+    @n_outcomes_cutoff.setter
+    def n_outcomes_cutoff(self, value):
+        """
+        If ``n_outcomes`` exceeds this value,
+        ``representative_outcomes`` will use this
+        value in its place. This is useful in the case
+        of a finite yet untractible number of outcomes.
+
+        :param int value: Cutoff value.
+        """
+        self.n_outcomes_cutoff = value
+
+    ## ABSTRACT METHODS ##
+
+    ## CONCRETE METHODS ##
+    # These methods depend on the abstract methods, and thus their behaviors
+    # change in each inheriting class.
+
+    def domain(self, expparams):
+        """
+        Returns a list of :class:`Domain` objects, one for each input expparam.
+
+        :param numpy.ndarray expparams:  Array of experimental parameters. This
+            array must be of dtype agreeing with the ``expparams_dtype``
+            property, or, in the case where ``n_outcomes_constant`` is ``True``,
+            ``None`` should be a valid input.
+
+        :rtype: list of ``Domain``
+        """
+        # As a convenience to most users, we define domain for them. If a
+        # fancier domain is desired, this method can easily be overridden.
+        if self.is_n_outcomes_constant:
+            return self._domain if expparams is None else [self._domain for ep in expparams]
+        else:
+            return [qi.IntegerDomain(min=0, max=n_o - 1) for n_o in self.n_outcomes(expparams)]
+
+
+    def pr0_to_update_array(self, outcomes_ph, pr0, modelparams_debug=None):
+        """
+        Assuming a <sig_z> measurement (non majority voting!) with probabilities
+        given by the
+        array ``pr0``, returns an array of the form expected to be returned by
+        ``likelihood`` method.
+
+        :param numpy.ndarray outcomes: Array of integers indexing outcomes.
+        :param numpy.ndarray pr0: Array of shape ``(n_models, n_experiments)``
+            describing the probability of obtaining outcome ``0`` from each
+            set of model parameters and experiment parameters.
+        """
+        # in sigma_z space
+        pr0 = pr0[np.newaxis, ...]
+        pr1 = 1 - pr0
+
+        # probability to detect a single photon
+        pr1_phot = self._phot_1 * pr1 + self._phot_0 * pr0
+
+        # probability to detect r photons
+        R = self._n_sweeps
+
+        if len(np.shape(outcomes_ph)) == 0:
+            outcomes_ph = np.array(outcomes_ph)[None]
+
+        # Dinani (2019), eqn (8)
+        # outcomes[idx] * pr1 + (1 - outcomes[idx]) * pr0
+
+        # exact, intractable for big R:
+        # scipy.special.binom(R, r) * (pr1_phot) ** r[idx] * (1 - pr1_phot) ** (R - r[idx])
+        r = outcomes_ph
+
+        #print("w= {} Mhz".format(modelparams_debug/(2*np.pi)))
+        #print("pr1= {}".format(pr1))
+        #print("pr1_phot= {}".format(pr1_phot))
+        #print("R*pr1_phot= {}".format(R*pr1_phot))
+        #print("r= {}".format(r))
+
+        #print("(r-Rp)^2= {}".format((r - R*pr1_phot)**2))
+        import matplotlib.pyplot as plt
+        #plt.plot((r - R*pr1_phot).flatten()**2)
+        #plt.plot((r).flatten()**2)
+        #plt.show()
+        #plt.plot((R*pr1_phot).flatten()**2)
+
+
+        sigma = np.sqrt(r*(R-r)/R)
+        return np.concatenate([
+            1/(np.sqrt(2*np.pi)*sigma) *np.exp(-(r[idx]-R*pr1_phot)**2/(2*sigma**2))
+            for idx in range(safe_shape(outcomes_ph))
+        ])
+
+    def simulate_experiment(self, modelparams, expparams, repeat=1, res_no_noise=None, full_result=False):
+        """
+        Provides a simulated binary outcome for an experiment, given the model (self), and its parameters
+
+        :param np.ndarray modelparams: Set of model parameter vectors to be
+                updated.
+        :param np.ndarray expparams: An experiment parameter array describing
+            the experiment that was just performed.
+        :param flaot repeat: how many times the experiment is repeated before an update is called, can be useful for majority voting schemes
+
+        :return int: single integer representing the experimental outcome
+        """
+
+
+        all_outcomes = np.array([0, 1])
+
+        noisy = True
+        p1 = self.likelihood(all_outcomes, modelparams, expparams)
+        p1 = 1 - p1[0,0,0]   # maybe a bug somewhere else?
+
+        photons_0 = np.random.binomial(self._n_sweeps, p=self._phot_0)
+        photons_1 = np.random.binomial(self._n_sweeps, p=self._phot_1)
+
+        # no noise
+        # debug only!
+        photons_0 = self._n_sweeps * self._phot_0
+        photons_1 = self._n_sweeps * self._phot_1
+
+        # sig_z -> #photons
+        phot_r = p1 * photons_1 + (1-p1) * photons_0  # Dinani eqn (3)
+
+        if not full_result:
+            raise NotImplementedError
+        if not noisy:
+            # in principle can return photn expecatation value
+            # photons_0 = self._n_sweeps * self._phot_0
+            raise NotImplementedError
+
+        return phot_r
+
+
 
 ####################################################
 ########## Ramsey models
 ####################################################
  
-class ExpDecoKnownPrecessionModel():
+class ExpDecoKnownPrecessionModel(qi.FiniteOutcomeModel):
     r"""
     Model that simulates a sinusoidal Precession in magnetic field, 
     imposing a (known) decoherence as a user-defined parameter
@@ -235,42 +431,18 @@ class ExpDecoKnownPrecessionModel():
         conditioned on a particular experiment having been performed.
         By default, this is the trivial function
         :math:`\vec{x}(t_{k+1}) = \vec{x}(t_k)`.
-        
+
         :param np.ndarray modelparams: Set of model parameter vectors to be
             updated.
         :param np.ndarray expparams: An experiment parameter array describing
             the experiment that was just performed.
-        
+
         :return np.ndarray: Array of shape
             ``(n_models, n_modelparams, n_experiments)`` describing the update
             of each model according to each experiment.
         """
-        return np.tile(modelparams, (expparams.shape[0],1,1)).transpose((1,2,0))   
+        return np.tile(modelparams, (expparams.shape[0],1,1)).transpose((1,2,0))
 
-
-    @staticmethod
-    def pr0_to_likelihood_array(outcomes, pr0):
-        """
-        Assuming a two-outcome measurement with probabilities given by the
-        array ``pr0``, returns an array of the form expected to be returned by
-        ``likelihood`` method.
-        
-        :param numpy.ndarray outcomes: Array of integers indexing outcomes.
-        :param numpy.ndarray pr0: Array of shape ``(n_models, n_experiments)``
-            describing the probability of obtaining outcome ``0`` from each
-            set of model parameters and experiment parameters.
-        """
-        pr0 = pr0[np.newaxis, ...]
-        pr1 = 1 - pr0
-
-        if len(np.shape(outcomes)) == 0:
-            outcomes = np.array(outcomes)[None]
-                    
-        return np.concatenate([
-            pr0 if outcomes[idx] == 0 else pr1
-            for idx in range(safe_shape(outcomes))
-        ]) 
-    
     
     ## PROPERTIES ##
     
@@ -399,7 +571,17 @@ class ExpDecoKnownPrecessionModel():
         dw = modelparams[:,0]
         
         # ESSENTIAL STEP > the likelihoods (i.e. cosines with a damping exp term) are evaluated for all particles
-        pr0 = np.zeros((modelparams.shape[0], expparams.shape[0]))
+        # Allocating first serves to make sure that a shape mismatch later
+        # will cause an error.
+        if modelparams.shape[0] == 1:
+            # calling with only expparams changing
+            pr0 = np.zeros((modelparams.shape[0], expparams.shape[0]))
+        else:
+            # model and exp params change
+            # -> every line of model param corresponds to a line of exp params
+            # allows to parallize computation
+            pr0 = np.zeros((modelparams.shape[0], 1))
+
         l = np.exp(-t*self._invT2) * (np.cos(t * dw / 2) ** 2) + 0.5*(1-np.exp(-t*self._invT2))
 
 
@@ -528,11 +710,7 @@ class MultimodePrecModel(qi.FiniteOutcomeModel):
     def likelihood(self, outcomes, modelparams, expparams):
         # By calling the superclass implementation, we can consolidate
         # call counting there.
-        super(MultimodePrecModel, self).likelihood(
-            outcomes, modelparams, expparams
-        )
-
-        # print('outcomes = ' + repr(outcomes))
+        super(MultimodePrecModel, self).likelihood(outcomes, modelparams, expparams)
 
         # Possibly add a second axis to modelparams.
         if len(modelparams.shape) == 1:
@@ -916,9 +1094,98 @@ class MultimodeDDModel(qi.FiniteOutcomeModel):
 
         # By calling the superclass implementation, we can consolidate
         # call counting there.
-        super().likelihood(
-            outcomes, modelparams, expparams
-        )
+        super().likelihood(outcomes, modelparams, expparams)
+
+        # Possibly add a second axis to modelparams.
+        if len(modelparams.shape) == 1:
+            modelparams = modelparams[..., np.newaxis]
+
+        t = expparams['t']*1e-6/2.  #  s, tau -> t_evol in Zhao
+        n_dd = expparams['n']
+        A_par = modelparams[:,0]*1e6  # A_par [Hz rad]
+        A_perp =  modelparams[:,1]*1e6
+        A = np.sqrt(A_par**2 + A_perp**2)
+        A_as_B = A / self._gamma  # Hz rad --> Gauss
+        alpha = np.arccos(A_par / A)
+        B = self._b_gauss
+
+        h_0 = self._b_gauss
+        # assumes NV || B => B=0 along A_perp
+        h_1 = np.sqrt((B - A_par / self._gamma)** 2 + (A_perp / self._gamma)** 2)
+
+        phi_h01 = np.arcsin(A_as_B * np.sin(alpha) / (np.sqrt(B ** 2 - 2 * A_as_B * B * np.cos(alpha) + A_as_B ** 2)))
+
+        # gamma in Hz rad / G (w units)
+        theta_0 = self._gamma * h_0 * t
+        theta_1 = self._gamma * h_1 * t
+        alpha = np.arctan( (np.sin(theta_0/2) * np.sin(theta_1/2) * np.sin(phi_h01))/
+                           (np.cos(theta_0/2) * np.cos(theta_1/2) - np.sin(theta_0/2)*np.sin(theta_1/2)*np.cos(phi_h01))
+                          )
+        theta = 2*np.arccos(np.cos(theta_0)*np.cos(theta_1) - np.sin(theta_0)*np.sin(theta_1)*np.cos(phi_h01)
+                            )
+
+        # Allocating first serves to make sure that a shape mismatch later
+        # will cause an error.
+        if modelparams.shape[0] == 1:
+            # calling with only expparams changing
+            pr0 = np.zeros((modelparams.shape[0], expparams.shape[0]))
+        else:
+            # model and exp params change
+            # -> every line of model param corresponds to a line of exp params
+            # allows to parallize computation
+            pr0 = np.zeros((modelparams.shape[0], 1))
+
+
+        l_hahn = 1 - 2* np.sin(phi_h01)**2 *np.sin(theta_0/2)**2 * np.sin(theta_1/2)**2
+        l_dd = 1 - 2 * np.sin(alpha) ** 2 * np.sin(n_dd * theta / 4) ** 2
+        l_corr = 0  # this is an approximation!
+
+        # if n_dd % 2 == 0: second expression, else, first
+        l_dd = (n_dd % 2)* (l_hahn*l_dd + l_corr) + (((n_dd + 1)% 2))* l_dd
+        if self._t2_a is 0:  # guaranteed that both T2 == 0
+            l = 0.5 + 0.5 * l_dd
+        else:
+            # adapted from Taminiau (2012) Suppl, doesn't work well
+            # l =   0.5+0.5*np.exp(-n_dd*t/(self._t2_a))*l_dd #+ 0.5*(np.exp(-n_dd*t/(self._t2_b)))  # (np.exp(-n_dd*t/(self._t2_b)) np.exp(-n_dd*t/(self._t2_a))
+            # own: T2_a: decay of the modulation only. T2_b: decay of the baseline
+            l = 0.5*(np.exp(-n_dd*t/(self._t2_a))* (l_dd-1)) + (0.5*np.exp(-n_dd*t/(self._t2_b)) + 0.5)
+
+
+        try:
+            pr0[:, :] = l[..., np.newaxis]
+        except ValueError:
+            pr0[:, :] = l[np.newaxis, ...]
+
+        return super().pr0_to_likelihood_array(outcomes, pr0)
+
+class MultimodeDDPhotModel(PhotonOutcomeModel, MultimodeDDModel):
+    r"""
+    ad hoc modification of the SimplePrecession model to include multimode capabilities in term of
+    an explicitly degenerate 2-param likelihood
+    """
+
+    ## INITIALIZER ##
+
+    def __init__(self, phot_0, phot_1, n_sweeps, b_gauss=100, min_freq=0, T2_a=0, T2_b=0):
+        PhotonOutcomeModel.__init__(self, phot_0, phot_1, n_sweeps)
+        self._min_freq = min_freq
+        self._b_gauss = b_gauss
+        self._gamma = 1.07084e3 * 2*np.pi # 13-C, Hz/G, [w] = Hz rad
+        self._t2_a = T2_a
+        self._t2_b = T2_b
+
+        if (self._t2_a == 0 and self._t2_b != 0) or \
+                (self._t2_b == 0 and self._t2_a != 0):
+            raise ValueError("Can't set only a single T2")
+
+    def likelihood(self, outcomes, modelparams, expparams, calc_update_step=False):
+        # exact shaddow to MultiModeDDModel, just calls different super()
+        # approximation: see labbook 20191114
+        # uses parameters: |A|, phi_01
+
+        # By calling the superclass implementation, we can consolidate
+        # call counting there.
+        super(MultimodeDDModel, self).likelihood(outcomes, modelparams, expparams)
 
         # Possibly add a second axis to modelparams.
         if len(modelparams.shape) == 1:
@@ -981,7 +1248,13 @@ class MultimodeDDModel(qi.FiniteOutcomeModel):
         except ValueError:
             pr0[:, :] = l[np.newaxis, ...]
 
-        return qi.FiniteOutcomeModel.pr0_to_likelihood_array(outcomes, pr0)
+        if calc_update_step:
+            return self.pr0_to_update_array(outcomes, pr0, modelparams)
+        else:
+            return super().pr0_to_likelihood_array(outcomes, pr0)
+
+
+
 
 class MultimodeDDModel_valAngle(MultimodeDDModel):
     r"""
@@ -1145,31 +1418,6 @@ class AparrKnownHahnModel():
             of each model according to each experiment.
         """
         return np.tile(modelparams, (expparams.shape[0], 1, 1)).transpose((1, 2, 0))
-
-    @staticmethod
-    def pr0_to_likelihood_array(outcomes, pr0):
-        """
-        Assuming a two-outcome measurement with probabilities given by the
-        array ``pr0``, returns an array of the form expected to be returned by
-        ``likelihood`` method.
-
-        :param numpy.ndarray outcomes: Array of integers indexing outcomes.
-        :param numpy.ndarray pr0: Array of shape ``(n_models, n_experiments)``
-            describing the probability of obtaining outcome ``0`` from each
-            set of model parameters and experiment parameters.
-        """
-        pr0 = pr0[np.newaxis, ...]
-        pr1 = 1 - pr0
-
-        if len(np.shape(outcomes)) == 0:
-            outcomes = np.array(outcomes)[None]
-
-        return np.concatenate([
-            pr0 if outcomes[idx] == 0 else pr1
-            for idx in range(safe_shape(outcomes))
-        ])
-
-        ## PROPERTIES ##
 
     @property
     def n_modelparams(self):
@@ -1406,30 +1654,6 @@ class BKnownHahnModel():
         """
         return np.tile(modelparams, (expparams.shape[0], 1, 1)).transpose((1, 2, 0))
 
-    @staticmethod
-    def pr0_to_likelihood_array(outcomes, pr0):
-        """
-        Assuming a two-outcome measurement with probabilities given by the
-        array ``pr0``, returns an array of the form expected to be returned by
-        ``likelihood`` method.
-
-        :param numpy.ndarray outcomes: Array of integers indexing outcomes.
-        :param numpy.ndarray pr0: Array of shape ``(n_models, n_experiments)``
-            describing the probability of obtaining outcome ``0`` from each
-            set of model parameters and experiment parameters.
-        """
-        pr0 = pr0[np.newaxis, ...]
-        pr1 = 1 - pr0
-
-        if len(np.shape(outcomes)) == 0:
-            outcomes = np.array(outcomes)[None]
-
-        return np.concatenate([
-            pr0 if outcomes[idx] == 0 else pr1
-            for idx in range(safe_shape(outcomes))
-        ])
-
-        ## PROPERTIES ##
 
     @property
     def n_modelparams(self):
@@ -1700,7 +1924,8 @@ class OptFish_T2RandPenalty_PGH(stdPGH):
                  inv_func=qi.expdesign.identity,
                  t_func=qi.expdesign.identity,
                  maxiters=10,
-                 other_fields=None, scale_f=2.0):
+                 other_fields=None, scale_f=2.0,
+                 calc_fi_mode='coarse_1'):
         """
         Apply a penalty on taus calculated from stdPGH and rescale them to lower values.
         :param tau_thresh_rescale: values above will be rescaled
@@ -1711,6 +1936,7 @@ class OptFish_T2RandPenalty_PGH(stdPGH):
         super().__init__(updater, inv_field, t_field, inv_func, t_func, maxiters, other_fields)
         self.tau_thresh_rescale = tau_thresh_rescale
         self.scale_f = scale_f
+        self._calc_fi_mode = calc_fi_mode
 
     def __call__(self):
         eps = super().__call__()
@@ -1774,7 +2000,7 @@ class OptFish_T2RandPenalty_PGH(stdPGH):
 
         #print("w= {}, tau_min= {}, uai_max: {}".format(west, tau_min, tau_max))
 
-        fi_list = [self.calc_fisher_information_at_w(west/(2*np.pi),
+        fi_list = [self.calc_fisher_information_at_w(west[0]/(2*np.pi),
                                                      t_us=t) for i, t in enumerate(tau_list_us)]
 
         idx_opt = np.argmax(fi_list)
@@ -1783,11 +2009,31 @@ class OptFish_T2RandPenalty_PGH(stdPGH):
 
     def calc_fisher_information_at_w(self, w_mhz, t_us=1):
 
-        expparams = np.empty((1,), dtype=[('t', '<f8'), ('w', '<f8')])  # tau (us)
+        try:
+            len_t = len(t_us)
+        except:
+            len_t = 1
+
+        expparams = np.empty((len_t,), dtype=[('t', '<f8'), ('w', '<f8')])  # tau (us)
         expparams['t'] = t_us
         expparams['w'] = 0
 
-        fi, _, w, _ = self._updater.calc_fisher_information(None, expparams, n_points=20)
+        if self._calc_fi_mode is "coarse_1":
+            n_points = 20
+            fi, _, w, _ = self._updater.calc_fisher_information(None, expparams, n_points=n_points)
+
+        elif self._calc_fi_mode is 'precise_1':
+            # NEW, should be more precise
+            n_points = 5  # how many required for good results with np.gradient?
+            w_arr = np.zeros((n_points, 1))
+
+            # biggest value of cov matrix as standard deviation
+            dw = np.sqrt(np.max(np.abs(self._updater.est_covariance_mtx()))) / (2 * np.pi) / 100  # mhz
+            w_arr[:, 0] = 2 * np.pi * np.linspace(w_mhz - dw, w_mhz + dw, n_points)
+
+            fi, _, w, _ = self._updater.calc_fisher_information(w_arr, expparams, n_points=n_points)
+
+
 
         idx = np.argmin(abs(w / (2 * np.pi) - w_mhz))
 
@@ -2671,6 +2917,8 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         while tau_left <= 0:
             tau_left += sigma_tau_us/25
 
+
+        ndd_range = self.get_ndd_range() # TODO
         tau_arr = np.concatenate([np.linspace(tau_left, tau_right, n_points).flatten(), np.asarray(tau_us)])
         n_dd_arr = np.concatenate([np.arange(n_dd_left, n_dd_right, self._restr_ndd_mod), np.asarray(n_dd)])
         tau_grid, n_grid = np.meshgrid(tau_arr, n_dd_arr)
@@ -3867,15 +4115,9 @@ class basic_SMCUpdater(qi.Distribution):
         w1_min, w1_max = w1_est-3*cov[0,0], w1_est+3*cov[0,0]
         w2_min, w2_max = w1_est - 3* cov[0, 0], w1_est + 3* cov[0, 0]
         """
-        #print("w1 {}, w2 {}".format(w1_est, w2_est))
-        #print("std w1 {}, w2 {}".format(cov[0,0], cov[1,1]))
-        #print("wi {} {}, w2 {} {}".format(w1_min, w1_max, w2_min, w2_max))
-        #print("w1 delta: {} w2 delta: {}".format(w1_max-w1_min, w2_max-w2_min))
 
         w1 = np.linspace(w1_min, w1_max, int(n_points))      # [MHz rad]
         w2 = np.linspace(w2_min, w2_max, int(n_points))
-        #print(w1)
-        #print(w2)
 
         expparams_fix = (expparams.shape == (1,))
         if expparams_fix:
@@ -3903,8 +4145,8 @@ class basic_SMCUpdater(qi.Distribution):
             #print("t2 in calc fi {} {}".format(self.model._t2_a,self.model._t2_a))
 
 
-
         p_for_state = 1
+
         p1 = self.model.likelihood(p_for_state, modelparams, expparams)
         if expparams_fix:
             p1 = p1.reshape(len(w1),len(w2))
@@ -3919,19 +4161,42 @@ class basic_SMCUpdater(qi.Distribution):
         return 1/(p1*(1-p1))*d_p1_par**2, 1/(p1*(1-p1))*d_p1_perp**2, w1, w2
 
     def _calc_fi_1d(self, modelparams, expparams, n_points=None):
-        if n_points is None:
-            n_points = self.n_particles
 
-        prior = self.sample(n=self.n_particles)
-        w1_min, w1_max = np.min(prior[:,0]), np.max(prior[:,0])
+        if modelparams is None:
+            # caluluate fi over whole prior
+            if n_points is None:
+                n_points = self.n_particles/2
 
-        w1 =  np.linspace(w1_min, w1_max, int(n_points))      # [Hz rad]
+            prior = self.sample(n=self.n_particles)
+            w1_min, w1_max = np.min(prior[:,0]), np.max(prior[:,0])
 
-        modelparams = np.zeros((len(w1),))
-        modelparams[:] = w1
+        else:
+            w1_min, w1_max = np.min(modelparams[:,0]), np.max(modelparams[:,0])
+
+        w1 = np.linspace(w1_min, w1_max, int(n_points))      # [Hz rad]
+
+        expparams_fix = (expparams.shape == (1,))
+        if expparams_fix:
+            modelparams = np.zeros((len(w1),))
+            modelparams[:] = w1
+        else:
+            exp_t_array = expparams['t']
+            w1_grid, t_grid = np.meshgrid(w1, exp_t_array)
+
+            modelparams = np.zeros((len(w1) * len(exp_t_array), 1))
+            modelparams[:, 0] = w1_grid.flatten()
+
+            expparams = np.zeros((len(w1) * len(exp_t_array),),
+                                 dtype=[('t', '<f8'), ('w', '<f8')])  # tau (us)
+            expparams['t'] = t_grid.flatten()
+
 
         p_for_state = 1
         p1 = self.model.likelihood(p_for_state, modelparams, expparams)[0].flatten()
+        if expparams_fix:
+            p1 = p1.reshape(len(w1))
+        else:
+            p1 = p1.reshape(len(w1), len(exp_t_array))
 
         d_p1 =np.gradient(p1, (w1[1]-w1[0])*1e6, axis=0)
 
@@ -3949,8 +4214,90 @@ class basic_SMCUpdater(qi.Distribution):
 
             fi, w = self._calc_fi_1d(modelparams, expparams, n_points=n_points)
             return fi, None, w, None
-        except IndexError:
+        except (IndexError, ValueError):
             return self._calc_fi_2d(modelparams, expparams, n_points=n_points)
+
+class SMCPhotUpdater(basic_SMCUpdater):
+
+    def __init__(self,
+                 model, n_particles, prior,
+                 resample_a=None, resampler=None, resample_thresh=0.5,
+                 debug_resampling=False,
+                 track_resampling_divergence=False,
+                 zero_weight_policy='error', zero_weight_thresh=None
+                 ):
+        super().__init__(model, n_particles, prior,
+                 resample_a=resample_a, resampler=resampler, resample_thresh=resample_thresh,
+                 debug_resampling=debug_resampling,
+                 track_resampling_divergence=track_resampling_divergence,
+                 zero_weight_policy=zero_weight_policy, zero_weight_thresh=zero_weight_thresh,
+                 )
+
+    def hypothetical_update(self, outcomes, expparams, return_likelihood=False, return_normalization=False):
+        """
+        Produces the particle weights for the posterior of a hypothetical
+        experiment.
+
+        :param outcomes: Integer index of the outcome of the hypothetical
+            experiment.
+        :type outcomes: int or an ndarray of dtype int.
+        :param numpy.ndarray expparams: Experiments to be used for the hypothetical
+            updates.
+
+        :type weights: ndarray, shape (n_outcomes, n_expparams, n_particles)
+        :param weights: Weights assigned to each particle in the posterior
+            distribution :math:`\Pr(\omega | d)`.
+        """
+
+        # It's "hypothetical", don't want to overwrite old weights yet!
+        weights = self.particle_weights
+        locs = self.particle_locations
+
+        # Check if we have a single outcome or an array. If we only have one
+        # outcome, wrap it in a one-index array.
+        if not isinstance(outcomes, np.ndarray):
+            outcomes = np.array([outcomes])
+
+        # update the weights sans normalization
+        # Rearrange so that likelihoods have shape (outcomes, experiments, models).
+        # This makes the multiplication with weights (shape (models,)) make sense,
+        # since NumPy broadcasting rules align on the right-most index.
+        #locs = np.asarray(self.model._cheat_w_true)  # DEBUG ONLY
+        L = self.model.likelihood(outcomes, locs, expparams, calc_update_step=True).transpose([0, 2, 1])
+        hyp_weights = weights * L
+
+        # Sum up the weights to find the renormalization scale.
+        norm_scale = np.sum(hyp_weights, axis=2)[..., np.newaxis]
+
+        # As a special case, check whether any entries of the norm_scale
+        # are zero. If this happens, that implies that all of the weights are
+        # zero--- that is, that the hypothicized outcome was impossible.
+        # Conditioned on an impossible outcome, all of the weights should be
+        # zero. To allow this to happen without causing a NaN to propagate,
+        # we forcibly set the norm_scale to 1, so that the weights will
+        # all remain zero.
+        #
+        # We don't actually want to propagate this out to the caller, however,
+        # and so we save the "fixed" norm_scale to a new array.
+        fixed_norm_scale = norm_scale.copy()
+        fixed_norm_scale[np.abs(norm_scale) < np.spacing(1)] = 1
+
+        # normalize
+        norm_weights = hyp_weights / fixed_norm_scale
+        # Note that newaxis is needed to align the two matrices.
+        # This introduces a length-1 axis for the particle number,
+        # so that the normalization is broadcast over all particles.
+        if not return_likelihood:
+            if not return_normalization:
+                return norm_weights
+            else:
+                return norm_weights, norm_scale
+        else:
+            if not return_normalization:
+                return norm_weights, L
+            else:
+                return norm_weights, L, norm_scale
+
 
 
 
@@ -4509,5 +4856,6 @@ class NoisyExpDecoKnownPrecessionModel():
 
     def get_model(self):
         return self.model
+
 
 

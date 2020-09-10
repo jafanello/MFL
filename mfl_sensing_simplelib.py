@@ -2421,6 +2421,8 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         self._eps_prefactor = eps_prefactor
         self._coarse_opt_k = coarse_opt_k
         self._calc_fi_npoints = calc_fi_npoints
+        self._t2_penalty_thresh = 0
+        self._n_fiopt_retrials = 10
 
     def __call__(self, skip_optimize=False):
         eps = super().__call__()  # eps[t_] ~ 1/sig_p
@@ -2434,7 +2436,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         except IndexError:
             fi_max = -np.inf
 
-        i_trial, max_trial = 0, 10
+        i_trial, max_trial = 0, self._n_fiopt_retrials
         while bad_optimum and i_trial < max_trial:
             Apar, Aperp = self.estimate_mean()  # Mhz rad
 
@@ -2451,25 +2453,17 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
                 # todo: might be counterproductive, as fi calc in ealry epochs unaaccurate
                 eps = self._best_eps
                 t_evol_us = eps[self._t][0] * eps[self._n][0]  # us
-                fi_old = np.average(
-                    self.calc_fisher_information_at_A(Apar / (2 * np.pi), Aperp / (2 * np.pi), eps[self._t],
-                                                      eps[self._n]))
+                #fi_old = np.average(
+                #    self.calc_fisher_information_at_A(Apar / (2 * np.pi), Aperp / (2 * np.pi), eps[self._t],
+                #                                      eps[self._n]))
                 # print("Debug: Trying to go back to t_evol= {} us / {} ndd. Was/now FI= {} / {}".format(t_evol_us, eps[self._n][0],
                 #                                                                          fi_max, fi_old))
 
             # todo: best way to enforce not too long tau?
             t2 = np.average([self._updater.model._t2_a, self._updater.model._t2_b])  # todo: think of better
-            """
-            if t_evol_us > 2 * t2 *1e6:
-                eps[self._n] = self.round_up_to_mod(t_evol_us / (t2 * 1e6))
-                t_evol_us = t2*1e6
 
-            """
-            was_penalty_applied = False
-            while t_evol_us > 2 * t2 * 1e6 and t2 > 0:
-                # todo: with nomed_fi opt, this should be unnecessary
-                t_evol_us -= t_evol_us / 2  # todo: fixed constants problematic
-                was_penalty_applied = True
+            t_evol_us, was_penalty_applied = self.apply_t2_penalty(t_evol_us)
+
             # print("Current estimated Apar/Aperp: {}, {} MHz".format(Apar/(2*np.pi), Aperp/(2*np.pi)))
 
             # for a given t_tot, find n with optimized fisher info
@@ -2508,7 +2502,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
             # extend n_dd search range to higher vals, when hitting t2
             # no worries that we're overshooting t_evol here
 
-            if t_evol_us > t2 * 1e6 or was_penalty_applied:  # todo: problematic
+            if t_evol_us > t2/2 * 1e6 or was_penalty_applied:
                 # make search range in sigma_n huge to find minimum somewhere around T_2
                 tau_i_us = eps[self._t]
                 n_i = eps[self._n]
@@ -2580,6 +2574,20 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
     def eps_to_tevol(self, eps):
         t_evol_us = self._eps_prefactor * eps[self._t][0]
         return t_evol_us
+
+    def apply_t2_penalty(self, t_evol_us):
+
+        was_penalty_applied = False
+
+        t2 = np.average([self._updater.model._t2_a, self._updater.model._t2_b])  # todo: think of better
+
+        if self._t2_penalty_thresh > 0 and t2 > 0:
+            while t_evol_us > self._t2_penalty_thresh * 1e6:
+                # todo: with nomed_fi opt, this should be unnecessary
+                t_evol_us -= t_evol_us / 2  # todo: fixed constants problematic
+                was_penalty_applied = True
+
+        return t_evol_us, was_penalty_applied
 
     def _optimize_fi(self, tau_array_us, ndd_array, opt_mode='idx_avg', debug_plots=False):
 
@@ -2884,14 +2892,17 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         tau_res_k1 = self.calc_tau_k(Apar / (2 * np.pi), 1, no_warning=True)
         if tau_res_k1 * n_dd <= t2:
             sigma_tau_us = 1e6 * 3 * self.estimate_tau_res_width(tau_res_k1, n_dd)
+            #print("Debug: taus scan width: {} us".format(sigma_tau_us))
         else:
             # limit scan range to t2 line width
             sigma_tau_us = 1e6 * 3 * self.estimate_tau_res_width(tau_res_k1,
                                                                  self.round_up_to_mod(t2 / tau_res_k1,
                                                                                       mod=self._restr_ndd_mod))
+            #bug: limiting smallest tau scan width: {} us. Init t_evol= {} us".format(sigma_tau_us,
+            #                                                                                    tau_res_k1 * n_dd *1e6))
 
-        if sigma_tau_us < 0.15:
-            sigma_tau_us = 0.15
+        #if sigma_tau_us < 0.15:
+        #    sigma_tau_us = 0.15
         tau_left = tau_us - sigma_tau_us
         tau_right = tau_us + sigma_tau_us
 
@@ -2917,6 +2928,9 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         tau_arr = np.concatenate([np.linspace(tau_left, tau_right, n_points).flatten(), np.asarray(tau_us)])
         n_dd_arr = np.concatenate([ndd_range, np.asarray(n_dd)])
         tau_grid, n_grid = np.meshgrid(tau_arr, n_dd_arr)
+
+        #print(tau_arr[0])
+        #print(tau_arr[-2])
 
         tau_opt, ndd_opt = self._optimize_fi(tau_grid.flatten(), n_grid.flatten(), opt_mode, debug_plots=debug_plots)
 
@@ -3033,7 +3047,7 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
             # to keep output dimensionality consistent
             prior_paramspace = prior_paramspace[:,:, np.newaxis]
             fi_par = fi_par[:,:, np.newaxis]
-            fi_perp = fi_par[:, :, np.newaxis]
+            fi_perp = fi_perp[:, :, np.newaxis]
         else:
             #fi_par_list = [fi_par[:,:,i] for i in range(0, fi_par.shape[2])]
             # copy into higher dimension
@@ -3046,7 +3060,8 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         j_par = np.sum(integrand_par, axis=(0,1))   # dropping out Delta theta
         j_perp = np.sum(integrand_perp, axis=(0,1))
 
-
+        #print(j_par)
+        #print(j_perp)
         return j_par, j_perp
 
 
@@ -3087,7 +3102,10 @@ class MultiDD_EstAOptFish_PGH(MultiPGH):
         elif self._calc_fi_mode is 'baysian_fi_1':
             # this is actually not "at A"
             j_par, j_perp = self.calc_bayfisher_information_over_prior_A(tau_us, n_dd, n_points=self._calc_fi_npoints )
-            return list(zip(j_par, j_perp))
+
+            if len_t == 1:
+                return j_par[0], j_perp[0]
+            return [[el, j_perp[i]] for (i, el) in enumerate(j_par)]
         else:
             raise ValueError
 
@@ -3859,6 +3877,16 @@ class basic_SMCUpdater(qi.Distribution):
         """
         return 1 / (np.sum(self.particle_weights ** 2))
 
+    @property
+    def has_photon_model(self):
+        is_photon_model = False
+        try:
+            if self.model.is_photon_model: is_photon_model = True
+        except:
+            pass
+        return is_photon_model
+
+
     ## PRIVATE METHODS ########################################################
 
     def _maybe_resample(self):
@@ -4237,8 +4265,12 @@ class basic_SMCUpdater(qi.Distribution):
         d_p1_par = np.gradient(p1, (w1[1] - w1[0]) * 1e6, axis=0)
         d_p1_perp = np.gradient(p1, (w2[1] - w2[0]) * 1e6, axis=1)
 
-        # fisher information assuming quantum projection noise only
-        return 1 / (p1 * (1 - p1)) * d_p1_par ** 2, 1 / (p1 * (1 - p1)) * d_p1_perp ** 2, w1, w2
+        if self.has_photon_model:
+            # 1-p1= p0= k* N -> see PhD Schmitt
+            # is not absolute FI, but 1/k off. As this is a constant shouldn't matter for optimization.
+            return 1 / (1-p1) * d_p1_par ** 2, 1 / ((1 - p1)) * d_p1_perp ** 2, w1, w2
+        else:         # fisher information assuming quantum projection noise only
+            return 1 / (p1 * (1 - p1)) * d_p1_par ** 2, 1 / (p1 * (1 - p1)) * d_p1_perp ** 2, w1, w2
 
     def _calc_fi_1d(self, modelparams, expparams, n_points=None):
 
@@ -4279,8 +4311,13 @@ class basic_SMCUpdater(qi.Distribution):
 
         d_p1 = np.gradient(p1, (w1[1] - w1[0]) * 1e6, axis=0)
 
-        # fisher information assuming quantum projection noise only
-        return 1 / (p1 * (1 - p1)) * d_p1 ** 2, w1
+
+        if self.has_photon_model:
+            # 1-p1= p0= k* N -> see PhD Schmitt
+            # is not absolute FI, but 1/k off. As this is a constant shouldn't matter for optimization.
+            return 1 / (1 - p1) * d_p1 ** 2, w1
+        else:       # fisher information assuming quantum projection noise only
+            return 1 / (p1*(1 - p1)) * d_p1 ** 2, w1
 
     def calc_fisher_information(self, modelparams, expparams, n_points=None):
         """

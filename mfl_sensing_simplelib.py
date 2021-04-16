@@ -270,6 +270,8 @@ class PhotonOutcomeModel(qi.Model):
         given by the
         array ``pr0``, returns an array of the form expected to be returned by
         ``likelihood`` method.
+        Here, the measurement outcome is given as a photon number, not SSR result
+        |0> / |1>. See Dinani (2019).
 
         :param numpy.ndarray outcomes: Array of integers indexing outcomes.
         :param numpy.ndarray pr0: Array of shape ``(n_models, n_experiments)``
@@ -289,31 +291,39 @@ class PhotonOutcomeModel(qi.Model):
         if len(np.shape(outcomes_ph)) == 0:
             outcomes_ph = np.array(outcomes_ph)[None]
 
-        # Dinani (2019), eqn (8)
-        # outcomes[idx] * pr1 + (1 - outcomes[idx]) * pr0
 
-        # exact, intractable for big R:
-        # scipy.special.binom(R, r) * (pr1_phot) ** r[idx] * (1 - pr1_phot) ** (R - r[idx])
+        # outcomes[idx] * pr1 + (1 - outcomes[idx]) * pr0
         r = outcomes_ph
 
-        # print("w= {} Mhz".format(modelparams_debug/(2*np.pi)))
-        # print("pr1= {}".format(pr1))
-        # print("pr1_phot= {}".format(pr1_phot))
-        # print("R*pr1_phot= {}".format(R*pr1_phot))
-        # print("r= {}".format(r))
+        """
+        print("w= {} Mhz".format(modelparams_debug/(2*np.pi)))
+        print("pr1= {}".format(pr1))
+        print("pr1_phot= {}".format(pr1_phot))
+        print("R*pr1_phot= {}".format(R*pr1_phot))
+        print("r= {}".format(r))
 
-        # print("(r-Rp)^2= {}".format((r - R*pr1_phot)**2))
+        print("(r-Rp)^2= {}".format((r - R*pr1_phot)**2))
         import matplotlib.pyplot as plt
-        # plt.plot((r - R*pr1_phot).flatten()**2)
-        # plt.plot((r).flatten()**2)
-        # plt.show()
-        # plt.plot((R*pr1_phot).flatten()**2)
+        plt.plot((r - R*pr1_phot).flatten()**2)
+        plt.plot((r).flatten()**2)
+        plt.show()
+        plt.plot((R*pr1_phot).flatten()**2)
+        """
 
-        sigma = np.sqrt(r * (R - r) / R)
-        return np.concatenate([
-            1 / (np.sqrt(2 * np.pi) * sigma) * np.exp(-(r[idx] - R * pr1_phot) ** 2 / (2 * sigma ** 2))
-            for idx in range(safe_shape(outcomes_ph))
-        ])
+        if R == 1:
+            # Dinani (2019), eqn (8)
+            # exact, intractable for big R:
+            p_r = np.concatenate([
+                scipy.special.binom(R, r) * (pr1_phot) ** r[idx] * (1 - pr1_phot) ** (R - r[idx])
+                for idx in range(safe_shape(outcomes_ph))])
+        else:
+            # approx for big R,r
+            sigma = np.sqrt(r * (R - r) / R)
+            p_r = np.concatenate([
+                1 / (np.sqrt(2 * np.pi) * sigma) * np.exp(-(r[idx] - R * pr1_phot) ** 2 / (2 * sigma ** 2))
+                for idx in range(safe_shape(outcomes_ph))])
+
+        return p_r
 
     def simulate_experiment(self, modelparams, expparams, repeat=1, res_no_noise=None, full_result=False):
         """
@@ -370,12 +380,13 @@ class ExpDecoKnownPrecessionModel(qi.FiniteOutcomeModel):
 
     ## INITIALIZER ##
 
-    def __init__(self, min_freq=0, invT2=0.):
+    def __init__(self, min_freq=0, invT2=0., phi0=0.):
         super(ExpDecoKnownPrecessionModel, self).__init__()
 
         self._min_freq = min_freq
         self._invT2 = invT2
         self._eta_assym = 1.0
+        self._phi0 = phi0
 
         # Initialize a default scale matrix.
         self._Q = np.ones((self.n_modelparams,))
@@ -565,7 +576,7 @@ class ExpDecoKnownPrecessionModel(qi.FiniteOutcomeModel):
             # allows to parallize computation
             pr0 = np.zeros((modelparams.shape[0], 1))
 
-        l = np.exp(-t * self._invT2) * (np.cos(t * dw / 2) ** 2) + 0.5 * (1 - np.exp(-t * self._invT2))
+        l = np.exp(-t * self._invT2) * (np.cos(t * dw / 2 + self._phi0) ** 2) + 0.5 * (1 - np.exp(-t * self._invT2))
 
         # prepare output dimensions st. plot_zs() works
         try:
@@ -579,6 +590,70 @@ class ExpDecoKnownPrecessionModel(qi.FiniteOutcomeModel):
         pr1 = self._eta_assym * (1 - pr0)
 
         return self.pr0_to_likelihood_array(outcomes, 1 - pr1)
+
+class ExpDecoKnownPrecPhotModel(PhotonOutcomeModel, ExpDecoKnownPrecessionModel):
+    r"""
+    ad hoc modification of the SimplePrecession model to include multimode capabilities in term of
+    an explicitly degenerate 2-param likelihood
+    """
+
+    ## INITIALIZER ##
+
+    def __init__(self, phot_0, phot_1, n_sweeps, min_freq=0, invT2=0., phi0=0.):
+        PhotonOutcomeModel.__init__(self, phot_0, phot_1, n_sweeps)
+
+        self._min_freq = min_freq
+        self._invT2 = invT2
+        self._eta_assym = 1.0
+        self._phi0 = phi0
+
+    def likelihood(self, outcomes, modelparams, expparams, calc_update_step=False):
+        # exact shaddow to MultiModeDDModel, just calls different super()
+        # approximation: see labbook 20191114
+        # uses parameters: |A|, phi_01
+
+        # By calling the superclass implementation, we can consolidate
+        # call counting there.
+        super(ExpDecoKnownPrecessionModel, self).likelihood(outcomes, modelparams, expparams)
+
+        # Possibly add a second axis to modelparams.
+        if len(modelparams.shape) == 1:
+            modelparams = modelparams[..., np.newaxis]
+
+        t = expparams['t']
+        dw = modelparams[:, 0]
+
+        # ESSENTIAL STEP > the likelihoods (i.e. cosines with a damping exp term) are evaluated for all particles
+        # Allocating first serves to make sure that a shape mismatch later
+        # will cause an error.
+        if modelparams.shape[0] == 1:
+            # calling with only expparams changing
+            pr0 = np.zeros((modelparams.shape[0], expparams.shape[0]))
+        else:
+            # model and exp params change
+            # -> every line of model param corresponds to a line of exp params
+            # allows to parallize computation
+            pr0 = np.zeros((modelparams.shape[0], 1))
+
+        l = np.exp(-t * self._invT2) * (np.cos(t * dw / 2 + self._phi0) ** 2) + 0.5 * (1 - np.exp(-t * self._invT2))
+
+        # prepare output dimensions st. plot_zs() works
+        try:
+            pr0[:, :] = l.transpose()
+        except ValueError:
+            try:
+                pr0[:, :] = l[..., np.newaxis]
+            except ValueError:
+                pr0[:, :] = l[np.newaxis, ...]
+
+        pr1 = self._eta_assym * (1 - pr0)
+
+        if calc_update_step:
+            return self.pr0_to_update_array(outcomes, 1 - pr1, modelparams)
+        else:
+            return super().pr0_to_likelihood_array(outcomes, 1 - pr1)
+
+
 
 
 class MultimodePrecModel(qi.FiniteOutcomeModel):
@@ -1234,6 +1309,7 @@ class MultimodeDDPhotModel(PhotonOutcomeModel, MultimodeDDModel):
             return self.pr0_to_update_array(outcomes, pr0, modelparams)
         else:
             return super().pr0_to_likelihood_array(outcomes, pr0)
+
 
 
 class MultimodeDDModel_valAngle(MultimodeDDModel):
@@ -2144,8 +2220,8 @@ class MultiPGH(qi.Heuristic):
                 rounded[rounded > max_int] = max_int
         except TypeError:
             # handle single value input
-            if rounded < min_int: return int(min_int)
-            if rounded > max_int and max_int > 0: return int(max_int)
+            if rounded < min_int: return int(int(np.round(min_int / mod) * mod))
+            if rounded > max_int and max_int > 0: return int(np.round(max_int / mod) * mod)
 
         return int(rounded)
 
